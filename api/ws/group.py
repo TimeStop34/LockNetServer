@@ -2,6 +2,7 @@ from core.ws import RequestManager, WSEndpointModel
 from services.event_publisher import (
     publish_group_created_event,
     publish_group_invite_created_events,
+    publish_to_group,
 )
 from .router import ws_router
 from services.group_services import GroupService
@@ -114,6 +115,14 @@ async def handle_join_group(user_id: int, model: JoinGroupModel, rm: RequestMana
     async with AsyncSessionLocal() as db:
         try:
             group = await GroupService.join_group_logic(db, user_id, public_id)
+
+            event_data = {
+                "type": "group_membership_changed",
+                "id": None,
+                "data": {"group_id": group.id, "change": "added", "user_id": user_id},
+            }
+            await publish_to_group(group.id, event_data)
+
             await rm.send_response("join_group", model.id, {"group": group.model_dump(mode='json')})
         except ConflictError:
             await rm.send_error("already_member", "You are already a member of this group", model.id)
@@ -131,6 +140,15 @@ async def handle_leave_group(user_id: int, model: LeaveGroupModel, rm: RequestMa
     async with AsyncSessionLocal() as db:
         try:
             result = await GroupService.leave_group_logic(db, user_id, group_id)
+
+            if not result.get("deleted"):
+                event_data = {
+                    "type": "group_membership_changed",
+                    "id": None,
+                    "data": {"group_id": int(group_id), "change": "left", "user_id": user_id},
+                }
+                await publish_to_group(int(group_id), event_data)
+
             await rm.send_response("leave_group", model.id, result)
         except NotFoundError as e:
             if "Not a member" in str(e):
@@ -139,7 +157,7 @@ async def handle_leave_group(user_id: int, model: LeaveGroupModel, rm: RequestMa
                 await rm.send_error("group_not_found", "Group not found", model.id)
         except Exception as e:
             await rm.send_error("internal_error", f"Internal error: {e}", model.id)
-
+            
 @ws_router.register("get_groups", GetGroupsModel)
 async def handle_get_groups(user_id: int, model: GetGroupsModel, rm: RequestManager):
     async with AsyncSessionLocal() as db:

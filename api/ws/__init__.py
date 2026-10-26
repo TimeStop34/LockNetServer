@@ -1,9 +1,9 @@
-# Импортируем все файлы с обработчиками, чтобы декораторы сработали
 from . import ping
 from . import group
 from . import event
-
-# Экспортируем роутер для использования в websocket.py
+from . import cross_signing
+from . import keys
+from . import messaging
 from .router import ws_router
 
 __all__ = ["ws_router"]

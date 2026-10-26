@@ -18,8 +18,12 @@ class Settings(BaseSettings):
     SSL_KEYFILE: str = "res/key.pem"
     SSL_CERTFILE: str = "res/cert.pem"
 
+    # Messages
+    MESSAGE_EDIT_WINDOW_HOURS: int = 24
+    MESSAGE_MAX_BYTES: int = 65536
+    MESSAGE_RATE_LIMIT_PER_MINUTE: int = 30
+
     class Config:
-        # Файл .env ищем в папке res, либо через переменную окружения ENV_FILE
         env_file = os.getenv("ENV_FILE", "res/server.env")
         env_file_encoding = "utf-8"
 

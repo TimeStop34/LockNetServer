@@ -17,4 +17,3 @@ class User(Base):
     bio = Column(Text)
     pronouns = Column(String(32))
     is_bot = Column(Boolean, default=False)
-    public_key = Column(Text, nullable=True)  # <-- добавили поле для E2EE
