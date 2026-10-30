@@ -1,8 +1,11 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 from datetime import datetime, timezone
+
+from core import security
 from core.ed25519_utils import ed25519_verify, b64_decode_unpadded
 from core.exceptions import ConflictError, NotFoundError, UnauthorizedError
+from models.user import User
 from models.user_cross_signing_key import UserCrossSigningKey
 from models.session import Session as SessionModel
 
@@ -16,7 +19,7 @@ class CrossSigningService:
         self_signing_key: dict,
         user_signing_key: dict,
     ) -> None:
-        # 1. Already exists? (v1: first-time only)
+        # 1. First-time only (v1)
         stmt = select(UserCrossSigningKey.user_id).where(
             UserCrossSigningKey.user_id == user_id
         ).limit(1)
@@ -29,7 +32,7 @@ class CrossSigningService:
         if not msk or not ssk or not usk:
             raise ValueError("All three keys are required")
 
-        # 2. Extract signatures from SSK/USK (must be signed by own MSK)
+        # 2. SSK и USK должны быть подписаны MSK
         ssk_sigs = self_signing_key.get("signatures") or {}
         usk_sigs = user_signing_key.get("signatures") or {}
         ssk_sig = (ssk_sigs.get(str(user_id)) or {}).get("master")
@@ -38,13 +41,13 @@ class CrossSigningService:
         if not ssk_sig or not usk_sig:
             raise ValueError("SSK and USK must be signed by master key")
 
-        # 3. Verify Ed25519 (server-side, per point ⚠️)
+        # 3. Серверная Ed25519-валидация подписей
         if not ed25519_verify(msk, ssk_sig, b64_decode_unpadded(ssk)):
             raise ValueError("Invalid SSK signature from MSK")
         if not ed25519_verify(msk, usk_sig, b64_decode_unpadded(usk)):
             raise ValueError("Invalid USK signature from MSK")
 
-        # 4. Insert
+        # 4. Сохраняем три ключа
         db.add(UserCrossSigningKey(
             user_id=user_id, key_type="master",
             key_value=msk, signatures=master_key.get("signatures") or {},
@@ -66,7 +69,7 @@ class CrossSigningService:
         user_signatures: dict[str, str],
         device_signatures: dict[str, str],
     ) -> dict:
-        # Load signer's cross-signing keys
+        # Ключи подписанта
         stmt = select(UserCrossSigningKey).where(
             UserCrossSigningKey.user_id == signer_user_id
         )
@@ -78,7 +81,7 @@ class CrossSigningService:
         updated_users = 0
         updated_devices = 0
 
-        # --- user_signatures: USK(signer) signs MSK(target) ---
+        # user_signatures: наш USK подписывает чужой MSK
         for target_uid_str, sig in (user_signatures or {}).items():
             target_uid = int(target_uid_str)
             if target_uid == signer_user_id:
@@ -102,7 +105,7 @@ class CrossSigningService:
             target_msk.signatures = sigs
             updated_users += 1
 
-        # --- device_signatures: SSK(signer) signs own session's ed25519 ---
+        # device_signatures: наш SSK подписывает СВОЮ сессию
         for target_sid_str, sig in (device_signatures or {}).items():
             target_sid = int(target_sid_str)
             target_session = await db.get(SessionModel, target_sid)
@@ -135,12 +138,14 @@ class CrossSigningService:
         result = {}
 
         for uid in user_ids:
+            # Все три ключа пользователя
             stmt = select(UserCrossSigningKey).where(UserCrossSigningKey.user_id == uid)
             rows = (await db.execute(stmt)).scalars().all()
             keys = {r.key_type: r for r in rows}
             if "master" not in keys:
-                continue  # user hasn't set up cross-signing
+                continue  # пользователь ещё не настроил cross-signing
 
+            # Активные устройства с ed25519_key
             stmt = select(SessionModel).where(
                 SessionModel.user_id == uid,
                 SessionModel.expires_at > now,
@@ -176,3 +181,62 @@ class CrossSigningService:
             result[str(uid)] = entry
 
         return result
+
+    @staticmethod
+    async def reset_cross_signing_keys(
+        db: AsyncSession,
+        user_id: int,
+        password: str,
+    ) -> dict:
+        # 1. Пароль — защита от случайного/чужого сброса (UIA)
+        user = await db.get(User, user_id)
+        if not user or not security.verify_password(password, user.password_hash):
+            raise UnauthorizedError("Invalid password")
+
+        affected_users: set[int] = set()
+
+        # 2. Собираем signers: тех, кто подписал НАШ MSK своим USK.
+        #    Их подписи будут аннулированы вместе с удалением user_cross_signing_keys[user_id],
+        #    поэтому их тоже надо уведомить (push cross_signing_reset).
+        stmt = select(UserCrossSigningKey).where(
+            UserCrossSigningKey.user_id == user_id,
+            UserCrossSigningKey.key_type == "master",
+        )
+        own_msk = (await db.execute(stmt)).scalar()
+        if own_msk:
+            for signer_uid_str in (own_msk.signatures or {}).keys():
+                try:
+                    signer_uid = int(signer_uid_str)
+                except (ValueError, TypeError):
+                    continue
+                if signer_uid != user_id:
+                    affected_users.add(signer_uid)
+
+        # 3. Удаляем все свои cross-signing ключи (MSK/SSK/USK)
+        await db.execute(
+            delete(UserCrossSigningKey).where(UserCrossSigningKey.user_id == user_id)
+        )
+
+        # 4. Убираем свои SSK-подписи из своих сессий
+        stmt = select(SessionModel).where(SessionModel.user_id == user_id)
+        own_sessions = (await db.execute(stmt)).scalars().all()
+        for s in own_sessions:
+            sigs = dict(s.signatures or {})
+            if str(user_id) in sigs:
+                del sigs[str(user_id)]
+                s.signatures = sigs
+
+        # 5. Убираем свои USK-подписи из чужих MSK
+        stmt = select(UserCrossSigningKey).where(
+            UserCrossSigningKey.key_type == "master",
+            UserCrossSigningKey.user_id != user_id,
+        )
+        for msk in (await db.execute(stmt)).scalars().all():
+            sigs = dict(msk.signatures or {})
+            if str(user_id) in sigs:
+                del sigs[str(user_id)]
+                msk.signatures = sigs
+                affected_users.add(msk.user_id)
+
+        await db.commit()
+        return {"affected_users": sorted(affected_users)}

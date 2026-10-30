@@ -2,7 +2,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
-from typing import List
 
 from core.config import settings
 from core.snowflake import generator as snowflake_generator
@@ -37,34 +36,30 @@ class MessageService:
             raise ValueError("message_too_large")
 
     @staticmethod
-    async def _ensure_member(db: AsyncSession, chat_id: int, user_id: int) -> None:
+    async def _ensure_member(db, chat_id, user_id) -> None:
         group = await db.get(Group, chat_id)
         if not group:
             raise NotFoundError("chat_not_found")
         stmt = select(GroupMember).where(
-            GroupMember.group_id == chat_id,
-            GroupMember.user_id == user_id,
+            GroupMember.group_id == chat_id, GroupMember.user_id == user_id,
         )
         if (await db.execute(stmt)).scalar() is None:
             raise UnauthorizedError("not_a_member")
 
     @staticmethod
-    async def _message_row_to_dict(msg: Message, reactions: list) -> dict:
+    def _row_to_dict(msg: Message, reactions: list) -> dict:
         return {
-            "message_id": msg.id,
-            "chat_id": msg.chat_id,
-            "author_id": msg.author_id,
-            "author_session_id": msg.author_session_id,
+            "message_id": msg.id, "chat_id": msg.chat_id,
+            "author_id": msg.author_id, "author_session_id": msg.author_session_id,
             "encrypted": None if msg.deleted else msg.encrypted,
             "thread_id": msg.thread_id,
             "created_at": msg.created_at.isoformat() if msg.created_at else None,
             "edited_at": msg.edited_at.isoformat() if msg.edited_at else None,
-            "deleted": bool(msg.deleted),
-            "reactions": reactions,
+            "deleted": bool(msg.deleted), "reactions": reactions,
         }
 
     @staticmethod
-    async def _load_sender_session(db: AsyncSession, user_id: int, session_id: int) -> SessionModel:
+    async def _load_sender_session(db, user_id, session_id) -> SessionModel:
         session = await db.get(SessionModel, session_id)
         if not session or session.user_id != user_id:
             raise UnauthorizedError("Session not found")
@@ -80,13 +75,7 @@ class MessageService:
         return safe
 
     @staticmethod
-    async def send(
-        db: AsyncSession,
-        user_id: int,
-        session_id: int,
-        chat_id: int,
-        encrypted: dict,
-    ) -> dict:
+    async def send(db, user_id, session_id, chat_id, encrypted) -> dict:
         await MessageService._ensure_member(db, chat_id, user_id)
         MessageService._validate_encrypted(encrypted, session_id)
 
@@ -98,30 +87,21 @@ class MessageService:
 
         message_id = await snowflake_generator.generate()
         msg = Message(
-            id=message_id,
-            chat_id=chat_id,
-            author_id=user_id,
-            author_session_id=session_id,
-            encrypted=safe_encrypted,
-            thread_id=None,
+            id=message_id, chat_id=chat_id, author_id=user_id,
+            author_session_id=session_id, encrypted=safe_encrypted, thread_id=None,
         )
         db.add(msg)
-        await db.commit()
+        await db.flush()
         await db.refresh(msg)
 
         event_data = {
-            "type": "message_create",
-            "id": message_id,
+            "type": "message_create", "id": message_id,
             "data": {
-                "message_id": message_id,
-                "chat_id": chat_id,
-                "author_id": user_id,
-                "author_session_id": session_id,
-                "encrypted": safe_encrypted,
-                "thread_id": None,
+                "message_id": message_id, "chat_id": chat_id,
+                "author_id": user_id, "author_session_id": session_id,
+                "encrypted": safe_encrypted, "thread_id": None,
                 "created_at": msg.created_at.isoformat(),
-                "edited_at": None,
-                "reactions": [],
+                "edited_at": None, "reactions": [],
             },
         }
 
@@ -131,30 +111,25 @@ class MessageService:
 
         for member_uid in member_ids:
             if member_uid == user_id:
-                stmt = select(SessionModel.id).where(
+                s_stmt = select(SessionModel.id).where(
                     SessionModel.user_id == member_uid,
                     SessionModel.expires_at > now,
                     SessionModel.id != session_id,
                 )
             else:
-                stmt = select(SessionModel.id).where(
+                s_stmt = select(SessionModel.id).where(
                     SessionModel.user_id == member_uid,
                     SessionModel.expires_at > now,
                 )
-            target_sessions = [row[0] for row in (await db.execute(stmt)).all()]
+            target_sessions = [row[0] for row in (await db.execute(s_stmt)).all()]
             if target_sessions:
                 await EventService.create_event(db, member_uid, event_data, session_ids=target_sessions)
 
+        await db.commit()
         return {"message_id": message_id, "created_at": msg.created_at.isoformat()}
 
     @staticmethod
-    async def get_messages(
-        db: AsyncSession,
-        user_id: int,
-        chat_id: int,
-        before: int | None,
-        limit: int,
-    ) -> dict:
+    async def get_messages(db, user_id, chat_id, before, limit) -> dict:
         await MessageService._ensure_member(db, chat_id, user_id)
         if limit < 1 or limit > 100:
             raise ValueError("invalid_limit")
@@ -171,10 +146,10 @@ class MessageService:
         message_ids = [m.id for m in rows]
         agg = defaultdict(lambda: defaultdict(list))
         if message_ids:
-            rstmt = select(Reaction.message_id, Reaction.user_id, Reaction.emoji).where(
+            r_stmt = select(Reaction.message_id, Reaction.user_id, Reaction.emoji).where(
                 Reaction.message_id.in_(message_ids)
             )
-            for mid, uid, emoji in (await db.execute(rstmt)).all():
+            for mid, uid, emoji in (await db.execute(r_stmt)).all():
                 agg[mid][emoji].append(uid)
 
         result = []
@@ -183,18 +158,11 @@ class MessageService:
                 {"emoji": e, "count": len(uids), "user_ids": uids}
                 for e, uids in agg.get(m.id, {}).items()
             ]
-            result.append(await MessageService._message_row_to_dict(m, reactions))
-
+            result.append(MessageService._row_to_dict(m, reactions))
         return {"messages": result, "has_more": has_more}
 
     @staticmethod
-    async def edit(
-        db: AsyncSession,
-        user_id: int,
-        session_id: int,
-        message_id: int,
-        encrypted: dict,
-    ) -> dict:
+    async def edit(db, user_id, session_id, message_id, encrypted) -> dict:
         msg = await db.get(Message, message_id)
         if not msg:
             raise NotFoundError("message_not_found")
@@ -208,34 +176,28 @@ class MessageService:
             raise ValueError("edit_window_expired")
 
         MessageService._validate_encrypted(encrypted, session_id)
-
         sender_session = await MessageService._load_sender_session(db, user_id, session_id)
         safe_encrypted = MessageService._rewrite_sender_fields(encrypted, sender_session)
 
         msg.encrypted = safe_encrypted
         msg.edited_at = datetime.now(timezone.utc)
-        await db.commit()
+        await db.flush()
 
         event_data = {
-            "type": "message_update",
-            "id": msg.id,
+            "type": "message_update", "id": msg.id,
             "data": {
-                "message_id": msg.id,
-                "chat_id": msg.chat_id,
+                "message_id": msg.id, "chat_id": msg.chat_id,
                 "encrypted": safe_encrypted,
                 "edited_at": msg.edited_at.isoformat(),
             },
         }
         from services.event_publisher import publish_to_group
-        await publish_to_group(msg.chat_id, event_data)
+        await publish_to_group(db, msg.chat_id, event_data)
+        await db.commit()
         return {"message_id": msg.id, "edited_at": msg.edited_at.isoformat()}
 
     @staticmethod
-    async def delete(
-        db: AsyncSession,
-        user_id: int,
-        message_id: int,
-    ) -> dict:
+    async def delete(db, user_id, message_id) -> dict:
         msg = await db.get(Message, message_id)
         if not msg:
             raise NotFoundError("message_not_found")
@@ -252,33 +214,21 @@ class MessageService:
         if not msg.deleted:
             msg.deleted = True
             msg.deleted_at = datetime.now(timezone.utc)
-            await db.commit()
+            await db.flush()
 
             event_data = {
-                "type": "message_delete",
-                "id": msg.id,
+                "type": "message_delete", "id": msg.id,
                 "data": {"message_id": msg.id, "chat_id": msg.chat_id},
             }
             from services.event_publisher import publish_to_group
-            await publish_to_group(msg.chat_id, event_data)
+            await publish_to_group(db, msg.chat_id, event_data)
 
+        await db.commit()
         return {"message_id": msg.id}
 
     @staticmethod
-    async def send_to_device(
-        db: AsyncSession,
-        sender_user_id: int,
-        sender_session_id: int,
-        messages: dict,
-    ) -> dict:
-        """
-        Доставка to-device (Olm) события конкретным сессиям.
-        Сервер не расшифровывает. Подменяет sender_session_id и sender_key
-        на данные аутентифицированной сессии — защита от подмены.
-        """
-        sender_session = await MessageService._load_sender_session(
-            db, sender_user_id, sender_session_id
-        )
+    async def send_to_device(db, sender_user_id, sender_session_id, messages) -> dict:
+        sender_session = await MessageService._load_sender_session(db, sender_user_id, sender_session_id)
         if not sender_session.curve25519_key:
             raise ValueError("Sender has no curve25519_key — upload_keys first")
 
@@ -291,7 +241,6 @@ class MessageService:
             except (ValueError, TypeError):
                 dropped += 1
                 continue
-
             if not isinstance(sessions_dict, dict):
                 dropped += 1
                 continue
@@ -307,7 +256,6 @@ class MessageService:
                 if not target_session or target_session.user_id != target_uid:
                     dropped += 1
                     continue
-
                 if not isinstance(olm_payload, dict):
                     dropped += 1
                     continue
@@ -316,14 +264,9 @@ class MessageService:
                 safe_payload["sender_session_id"] = sender_session_id
                 safe_payload["sender_key"] = sender_session.curve25519_key
 
-                event_data = {
-                    "type": "to_device",
-                    "id": None,
-                    "data": safe_payload,
-                }
-                await EventService.create_event(
-                    db, target_uid, event_data, session_ids=[target_sid]
-                )
+                event_data = {"type": "to_device", "id": None, "data": safe_payload}
+                await EventService.create_event(db, target_uid, event_data, session_ids=[target_sid])
                 accepted += 1
 
+        await db.commit()
         return {"accepted": accepted, "dropped": dropped}

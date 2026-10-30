@@ -7,6 +7,7 @@ from .session_one_time_key import SessionOneTimeKey
 from .user_cross_signing_key import UserCrossSigningKey
 from .message import Message
 from .reaction import Reaction
+from .key_backup import KeyBackupVersion, KeyBackupItem
 
 __all__ = [
     "User", "Session",
@@ -15,4 +16,5 @@ __all__ = [
     "Event",
     "SessionOneTimeKey", "UserCrossSigningKey",
     "Message", "Reaction",
+    "KeyBackupVersion", "KeyBackupItem",
 ]

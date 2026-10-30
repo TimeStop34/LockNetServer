@@ -9,11 +9,11 @@ from pydantic import Field
 
 class UploadCrossSigningKeysModel(WSEndpointModel):
     data: dict = Field(default_factory=dict)
-
 class UploadSignaturesModel(WSEndpointModel):
     data: dict = Field(default_factory=dict)
-
 class QueryCrossSigningKeysModel(WSEndpointModel):
+    data: dict = Field(default_factory=dict)
+class ResetCrossSigningModel(WSEndpointModel):
     data: dict = Field(default_factory=dict)
 
 
@@ -46,20 +46,16 @@ async def handle_upload_signatures(user_id: int, model: UploadSignaturesModel, r
             result = await CrossSigningService.upload_signatures(
                 db, user_id, user_signatures, device_signatures,
             )
-            # Push to each target user whose MSK we signed
             for target_uid_str, sig in user_signatures.items():
                 target_uid = int(target_uid_str)
-                event_data = {
-                    "type": "cross_signing_signature_added",
-                    "id": None,
+                await EventService.create_event(db, target_uid, {
+                    "type": "cross_signing_signature_added", "id": None,
                     "data": {
-                        "signer_user_id": user_id,
-                        "key_type": "user_signing",
-                        "target": "master",
-                        "signature": sig,
+                        "signer_user_id": user_id, "key_type": "user_signing",
+                        "target": "master", "signature": sig,
                     },
-                }
-                await EventService.create_event(db, target_uid, event_data)
+                })
+            await db.commit()
         await rm.send_response("upload_signatures", model.id, result)
     except NotFoundError as e:
         await rm.send_error("not_found", str(e), model.id)
@@ -81,5 +77,27 @@ async def handle_query_cross_signing_keys(user_id: int, model: QueryCrossSigning
         async with AsyncSessionLocal() as db:
             result = await CrossSigningService.query_cross_signing_keys(db, user_ids)
         await rm.send_response("query_cross_signing_keys", model.id, result)
+    except Exception as e:
+        await rm.send_error("internal_error", f"Internal error: {e}", model.id)
+
+
+@ws_router.register("reset_cross_signing_keys", ResetCrossSigningModel)
+async def handle_reset_cross_signing_keys(user_id: int, model: ResetCrossSigningModel, rm: RequestManager):
+    password = model.data.get("password")
+    if not password:
+        await rm.send_error("password_required", "password is required", model.id)
+        return
+    try:
+        async with AsyncSessionLocal() as db:
+            result = await CrossSigningService.reset_cross_signing_keys(db, user_id, password)
+            for affected_uid in result["affected_users"]:
+                await EventService.create_event(db, affected_uid, {
+                    "type": "cross_signing_reset", "id": None,
+                    "data": {"user_id": user_id},
+                })
+            await db.commit()
+        await rm.send_response("reset_cross_signing_keys", model.id, result)
+    except UnauthorizedError:
+        await rm.send_error("invalid_password", "Invalid password", model.id)
     except Exception as e:
         await rm.send_error("internal_error", f"Internal error: {e}", model.id)
